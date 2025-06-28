@@ -1,0 +1,7 @@
+PySide6
+qtawesome
+pycryptodome
+tqdm
+requests
+mutagen
+pyncm 
