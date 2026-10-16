@@ -37,18 +37,95 @@ handler.setFormatter(logging.Formatter(fmt, datefmt))
 log.addHandler(handler)
 
 
+def audio_format_of(header):
+    """Return a file extension for a decrypted audio header, or None."""
+    if not header:
+        return None
+    if header[:4] == b'fLaC':
+        return 'flac'
+    if header[:3] == b'ID3':
+        return 'mp3'
+    if len(header) >= 2 and header[0] == 0xFF and (header[1] & 0xE0) == 0xE0:
+        return 'mp3'
+    if len(header) >= 12 and header[4:8] == b'ftyp':
+        return 'm4a'
+    if header[:4] == b'OggS':
+        return 'ogg'
+    if len(header) >= 12 and header[:4] == b'RIFF' and header[8:12] == b'WAVE':
+        return 'wav'
+    return None
+
+
+def _read_exact(fileobj, size):
+    data = fileobj.read(size)
+    if len(data) != size:
+        raise ValueError(f'truncated NCM file, expected {size} bytes')
+    return data
+
+
+def _read_u32(fileobj):
+    return struct.unpack('<I', _read_exact(fileobj, 4))[0]
+
+
+def _safe_audio_format(fmt):
+    fmt = str(fmt or 'mp3').lower().strip().lstrip('.')
+    if 2 <= len(fmt) <= 4 and fmt.isalnum():
+        return fmt
+    return 'mp3'
+
+
+def _file_has_audio_header(path):
+    try:
+        with open(path, 'rb') as existing:
+            return audio_format_of(existing.read(16)) is not None
+    except OSError:
+        return False
+
+
+def _read_cover_frame(fileobj):
+    """Consume the cover frame and return the embedded image bytes.
+
+    Bytes after the metadata block:
+
+        crc32            u32
+        version          u8
+        cover_frame_len  u32
+        image_len        u32
+        image            image_len bytes
+        unused           (cover_frame_len - image_len) bytes
+
+    Older dumps skipped five bytes after the CRC and treated the rest as
+    audio. That matches files whose cover frame is only the image. macOS
+    client 3.x still writes a cover frame when the image length is 0, and
+    decrypting those extra bytes makes the MP3 or FLAC unplayable.
+    """
+    _read_exact(fileobj, 4)
+    _read_exact(fileobj, 1)
+    cover_frame_len = _read_u32(fileobj)
+    image_len = _read_u32(fileobj)
+    if image_len > cover_frame_len:
+        raise ValueError(
+            f'invalid NCM cover frame: image length {image_len} exceeds frame {cover_frame_len}'
+        )
+    position = fileobj.tell()
+    remaining = fileobj.seek(0, os.SEEK_END) - position
+    fileobj.seek(position)
+    if cover_frame_len > remaining:
+        raise ValueError('invalid NCM cover frame: length exceeds remaining file')
+    image_data = _read_exact(fileobj, image_len) if image_len else b''
+    extra = cover_frame_len - image_len
+    if extra:
+        _read_exact(fileobj, extra)
+        log.info(f'Skipped {extra} unused cover-frame bytes')
+    return image_data
+
+
 def dump_single_file(filepath):
     try:
-
-        filename = filepath.split('/')[-1]
-        if not filename.endswith('.ncm'): return
-        filename = filename[:-4]
-        for ftype in ['mp3', 'flac']:
-            fname = f'{filename}.{ftype}'
-            if os.path.isfile(fname):
-                log.warning(f'Skipping "{filepath}" due to existing file "{fname}"')
-                return
-
+        if os.path.splitext(filepath)[1].lower() != '.ncm':
+            return None
+        stem = os.path.splitext(os.path.basename(filepath))[0]
+        directory = os.path.dirname(os.path.abspath(filepath)) or os.getcwd()
         log.info(f'Converting "{filepath}"')
 
         # hex to str
@@ -57,10 +134,9 @@ def dump_single_file(filepath):
         unpad = lambda s: s[0:-(s[-1] if isinstance(s[-1], int) else ord(s[-1]))]
         with open(filepath, 'rb') as f:
             header = f.read(8)
-            
-            # str to hex
-            assert binascii.b2a_hex(header) == b'4354454e4644414d'
-            f.seek(2, 1)
+            if header != b'CTENFDAM':
+                raise ValueError(f'not an ncm file: {filepath}')
+            f.seek(2, os.SEEK_CUR)
             key_length = f.read(4)
             key_length = struct.unpack('<I', bytes(key_length))[0]
             key_data = f.read(key_length)
@@ -99,16 +175,16 @@ def dump_single_file(filepath):
             meta_data = unpad(cryptor.decrypt(meta_data)).decode('utf-8')[6:]
             meta_data = json.loads(meta_data)
 
-            crc32 = f.read(4)
-            crc32 = struct.unpack('<I', bytes(crc32))[0]
-            f.seek(5, 1)
-            image_size = f.read(4)
-            image_size = struct.unpack('<I', bytes(image_size))[0]
-            image_data = f.read(image_size)
-            target_filename = filename + '.' + meta_data['format']
+            _read_cover_frame(f)
+            audio_format = _safe_audio_format(meta_data.get('format'))
+            target_filename = os.path.join(directory, f'{stem}.{audio_format}')
+            if os.path.isfile(target_filename) and _file_has_audio_header(target_filename):
+                log.warning(f'Skipping "{filepath}" due to existing file "{target_filename}"')
+                return os.path.abspath(target_filename)
 
+            detected_format = None
+            first_chunk = True
             with open(target_filename, 'wb') as m:
-                chunk = bytearray()
                 while True:
                     chunk = bytearray(f.read(0x8000))
                     chunk_length = len(chunk)
@@ -117,7 +193,16 @@ def dump_single_file(filepath):
                     for i in range(1, chunk_length + 1):
                         j = i & 0xff
                         chunk[i - 1] ^= key_box[(key_box[j] + key_box[(key_box[j] + j) & 0xff]) & 0xff]
+                    if first_chunk:
+                        detected_format = audio_format_of(chunk)
+                        first_chunk = False
                     m.write(chunk)
+
+        if detected_format and detected_format != audio_format:
+            renamed = os.path.join(directory, f'{stem}.{detected_format}')
+            os.replace(target_filename, renamed)
+            target_filename = renamed
+        target_filename = os.path.abspath(target_filename)
         log.info(f'Converted file saved at "{target_filename}"')
         return target_filename
 
@@ -154,11 +239,14 @@ def dump(*paths, output_dir=None, n_workers=None):
     if n_workers > 1:
         log.info(f'Running pyNCMDUMP with up to {n_workers} parallel workers')
         with Pool(processes=n_workers) as p:
-            list(p.map(dump_single_file, all_filepaths))
+            converted = list(p.map(dump_single_file, all_filepaths))
     else:
         log.info('Running pyNCMDUMP on single-worker mode')
-        for fp in tqdm(all_filepaths, leave=False): dump_single_file(fp)
+        converted = []
+        for fp in tqdm(all_filepaths, leave=False):
+            converted.append(dump_single_file(fp))
     log.info('All finished')
+    return [path for path in converted if path]
 
 
 if __name__ == '__main__':

@@ -1,141 +1,347 @@
 import os
 import shutil
 import traceback
-import requests
-from mutagen.mp3 import MP3
-from mutagen.id3 import ID3, APIC, USLT, TIT2, TPE1, TALB
-from pyncm.apis import cloudsearch, track
 
-# The ncmdump script is in the same directory, so a direct import should work
-# when the app is run from the project root.
+import requests
+from mutagen.flac import FLAC, Picture
+from mutagen.id3 import APIC, ID3, TALB, TIT2, TPE1, USLT
+from mutagen.mp3 import MP3
+
 from core import ncmdump
+
+# Playback does not depend on this. pyncm was removed from PyPI in May 2026;
+# the same title, lyric, and cover fields are still available from the public
+# NetEase endpoints below. A failure here leaves the decrypted audio untouched.
+_API = 'https://music.163.com'
+_HEADERS = {
+    'User-Agent': 'Mozilla/5.0',
+    'Referer': 'https://music.163.com/',
+}
+PLAYABLE_EXTENSIONS = {'.mp3', '.flac', '.m4a', '.ogg', '.wav'}
+
+
+def has_audio_header(song_path):
+    try:
+        with open(song_path, 'rb') as audio_file:
+            return ncmdump.audio_format_of(audio_file.read(16)) is not None
+    except OSError:
+        return False
+
+
+def _fallback_metadata(song_path):
+    return {
+        'path': os.path.abspath(song_path),
+        'title': os.path.splitext(os.path.basename(song_path))[0],
+        'artist': '未知艺术家',
+        'duration': 0,
+        'lyrics': None,
+        'cover_pixmap': None,
+    }
+
+
+def _text(value, default):
+    if value is None:
+        return default
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return default
+        value = value[0]
+    text = str(value).strip()
+    return text or default
 
 
 def get_song_metadata(song_path):
+    song_path = os.path.abspath(song_path)
+    if not os.path.isfile(song_path):
+        return None
     try:
-        audio = MP3(song_path, ID3=ID3)
-        tag = audio.tags
-        
-        metadata = {
-            "path": song_path,
-            "title": str(tag.get('TIT2', [os.path.basename(song_path).rsplit('.', 1)[0]])[0]),
-            "artist": str(tag.get('TPE1', ['未知艺术家'])[0]),
-            "duration": audio.info.length,
-            "lyrics": None,
-            "cover_pixmap": None
-        }
+        ext = os.path.splitext(song_path)[1].lower()
+        if ext == '.flac':
+            return _metadata_from_flac(song_path)
+        if ext == '.mp3':
+            return _metadata_from_mp3(song_path)
+        return _fallback_metadata(song_path)
+    except Exception:
+        traceback.print_exc()
+        return _fallback_metadata(song_path)
 
+
+def _frame_text(frame, default):
+    if frame is None:
+        return default
+    if hasattr(frame, 'text'):
+        return _text(frame.text, default)
+    return _text(frame, default)
+
+
+def _metadata_from_mp3(song_path):
+    audio = MP3(song_path, ID3=ID3)
+    tag = audio.tags
+    lyrics = None
+    if tag is not None:
         for key in tag.keys():
             if key.startswith('USLT'):
-                metadata['lyrics'] = tag[key].text
+                lyrics = _text(tag[key].text, None)
                 break
+    metadata = _fallback_metadata(song_path)
+    metadata.update({
+        'title': _frame_text(None if tag is None else tag.get('TIT2'), metadata['title']),
+        'artist': _frame_text(None if tag is None else tag.get('TPE1'), metadata['artist']),
+        'duration': getattr(audio.info, 'length', 0) or 0,
+        'lyrics': lyrics,
+    })
+    return metadata
 
-        # This part requires Qt, so we handle it in the main UI thread after loading
-        # for key in tag.keys():
-        #     if key.startswith('APIC:'):
-        #         img_data = tag[key].data
-        #         pixmap = QPixmap()
-        #         pixmap.loadFromData(img_data)
-        #         metadata['cover_pixmap'] = pixmap.scaled(200, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        #         break
-        
-        return metadata
-    except Exception as e:
-        traceback.print_exc()
-        return None
+
+def _metadata_from_flac(song_path):
+    audio = FLAC(song_path)
+    lyrics = None
+    for key in ('lyrics', 'unsyncedlyrics'):
+        if audio.get(key):
+            lyrics = _text(audio.get(key), None)
+            break
+    metadata = _fallback_metadata(song_path)
+    metadata.update({
+        'title': _text(audio.get('title'), metadata['title']),
+        'artist': _text(audio.get('artist'), metadata['artist']),
+        'duration': getattr(audio.info, 'length', 0) or 0,
+        'lyrics': lyrics,
+    })
+    return metadata
+
 
 def get_cover_data_from_tags(song_path):
     try:
+        ext = os.path.splitext(song_path)[1].lower()
+        if ext == '.flac':
+            audio = FLAC(song_path)
+            if audio.pictures:
+                return audio.pictures[0].data
+            return None
         audio = MP3(song_path, ID3=ID3)
         tag = audio.tags
+        if tag is None:
+            return None
         for key in tag.keys():
-            if key.startswith('APIC:'):
+            if key.startswith('APIC'):
                 return tag[key].data
     except Exception:
         return None
     return None
 
-def convert_ncm_to_mp3(ncm_path):
-    source_dir = os.path.dirname(ncm_path)
-    output_dir = 'output'
-    if not os.path.exists(output_dir): os.makedirs(output_dir)
 
-    original_cwd = os.getcwd()
+def _remove_stale_output(output_dir, destination_path):
+    stem = os.path.splitext(os.path.basename(destination_path))[0]
+    for name in os.listdir(output_dir):
+        candidate = os.path.join(output_dir, name)
+        if candidate == destination_path:
+            continue
+        if os.path.splitext(name)[0] != stem:
+            continue
+        if os.path.splitext(name)[1].lower() not in PLAYABLE_EXTENSIONS:
+            continue
+        if not has_audio_header(candidate):
+            os.remove(candidate)
+
+
+def convert_ncm_to_mp3(ncm_path):
+    """Decrypt one .ncm file into ./output and return the audio path.
+
+    The name is kept for existing callers. The result is .mp3 or .flac,
+    whichever format is inside the container.
+    """
+    output_dir = os.path.abspath('output')
+    os.makedirs(output_dir, exist_ok=True)
     try:
-        # ncmdump seems to work best when run from the file's directory
-        if source_dir: os.chdir(source_dir)
-        ncmdump.dump(os.path.basename(ncm_path))
+        produced = ncmdump.dump(os.path.abspath(ncm_path))
     except Exception:
         traceback.print_exc()
         return None
-    finally:
-        os.chdir(original_cwd)
+    if not produced:
+        return None
 
-    mp3_file = os.path.basename(ncm_path).replace('.ncm', '.mp3')
-    original_converted_path = os.path.join(source_dir, mp3_file)
+    source_path = produced[0]
+    if not source_path or not os.path.isfile(source_path):
+        return None
+    destination_path = os.path.join(output_dir, os.path.basename(source_path))
+    if os.path.abspath(source_path) != os.path.abspath(destination_path):
+        if os.path.exists(destination_path):
+            os.remove(destination_path)
+        shutil.move(source_path, destination_path)
+    _remove_stale_output(output_dir, destination_path)
+    return os.path.abspath(destination_path)
 
-    if os.path.exists(original_converted_path):
-        destination_path = os.path.join(output_dir, os.path.basename(original_converted_path))
-        try:
-            shutil.move(original_converted_path, destination_path)
-        except shutil.Error: # File might already exist
-            os.remove(original_converted_path)
-        return destination_path
-    return None
 
-def update_and_embed_metadata(mp3_path, title, artist):
+def _image_mime(cover_data):
+    if cover_data.startswith(b'\x89PNG'):
+        return 'image/png'
+    return 'image/jpeg'
+
+
+def embed_tags(audio_path, title, artist, album='', lyrics=None, cover_data=None):
+    ext = os.path.splitext(audio_path)[1].lower()
+    if ext == '.flac':
+        _embed_flac_tags(audio_path, title, artist, album, lyrics, cover_data)
+    elif ext == '.mp3':
+        _embed_mp3_tags(audio_path, title, artist, album, lyrics, cover_data)
+
+
+def _embed_mp3_tags(audio_path, title, artist, album, lyrics, cover_data):
+    audio = MP3(audio_path)
+    audio.tags = ID3()
+    audio.tags.add(TIT2(encoding=3, text=title or ''))
+    audio.tags.add(TPE1(encoding=3, text=artist or ''))
+    audio.tags.add(TALB(encoding=3, text=album or ''))
+    if lyrics:
+        audio.tags.add(USLT(encoding=3, lang='XXX', desc='Lyrics', text=lyrics))
+    if cover_data:
+        audio.tags.add(APIC(
+            encoding=3,
+            mime=_image_mime(cover_data),
+            type=3,
+            desc='Cover',
+            data=cover_data,
+        ))
+    audio.save(v2_version=3)
+
+
+def _embed_flac_tags(audio_path, title, artist, album, lyrics, cover_data):
+    audio = FLAC(audio_path)
+    audio['title'] = title or ''
+    audio['artist'] = artist or ''
+    audio['album'] = album or ''
+    if lyrics:
+        audio['lyrics'] = lyrics
+    audio.clear_pictures()
+    if cover_data:
+        picture = Picture()
+        picture.data = cover_data
+        picture.type = 3
+        picture.mime = _image_mime(cover_data)
+        picture.desc = 'Cover'
+        audio.add_picture(picture)
+    audio.save()
+
+
+def _get_json(url, params):
+    response = requests.get(url, params=params, headers=_HEADERS, timeout=10)
+    response.raise_for_status()
+    return response.json()
+
+
+def _search_songs(keyword):
+    payload = _get_json(f'{_API}/api/search/get', {
+        's': keyword,
+        'type': 1,
+        'limit': 30,
+        'offset': 0,
+    })
+    if payload.get('code') not in (200, None):
+        return []
+    return (payload.get('result') or {}).get('songs') or []
+
+
+def _choose_song(songs, title, artist):
+    if not songs:
+        return None
+    title_l = (title or '').lower().strip()
+    artist_l = (artist or '').lower().strip()
+    # The public search endpoint ranks covers ahead of the original recording.
+    noise_markers = ('原唱', '版', 'cover', 'dj', '钢琴', '吉他', '伴奏')
+    best = songs[0]
+    best_score = None
+    for song in songs:
+        name = str(song.get('name') or '').strip()
+        name_l = name.lower()
+        artists = '/'.join(
+            artist_info.get('name') or '' for artist_info in song.get('artists') or []
+        ).lower()
+        score = 0
+        if title_l and name_l == title_l:
+            score += 5
+        elif title_l and (title_l in name_l or name_l in title_l):
+            score += 2
+        if title_l and name_l != title_l:
+            for marker in noise_markers:
+                if marker.lower() in name_l and marker.lower() not in title_l:
+                    score -= 3
+                    break
+        if artist_l and artist_l in artists:
+            score += 4
+        if best_score is None or score > best_score:
+            best = song
+            best_score = score
+    return best
+
+
+def _names_from_song(song, title, artist):
+    title_from_api = song.get('name') or title
+    artist_names = [
+        artist_info.get('name')
+        for artist_info in (song.get('artists') or [])
+        if artist_info.get('name')
+    ]
+    artist_str = '/'.join(artist_names) or artist
+    album_str = (song.get('album') or {}).get('name') or ''
+    return title_from_api, artist_str, album_str
+
+
+def _split_filename(filename):
+    parts = [part.strip() for part in filename.replace('_', ' ').split('-', 1)]
+    if len(parts) == 2 and parts[0] and parts[1]:
+        return parts[1], parts[0]
+    return parts[0], ''
+
+
+def update_and_embed_metadata(audio_path, title, artist):
     try:
-        filename = os.path.basename(mp3_path).rsplit('.', 1)[0]
-        if not title or not artist: # If empty, use filename
-            # A more robust split for filenames like "Artist - Title"
-            parts = [p.strip() for p in filename.replace('_', ' ').split('-', 1)]
-            if len(parts) == 2:
-                artist, title = parts
-            else:
-                title = parts[0]
-                artist = ""
+        filename = os.path.splitext(os.path.basename(audio_path))[0]
+        if not title or not artist:
+            parsed_title, parsed_artist = _split_filename(filename)
+            title = title or parsed_title
+            artist = artist or parsed_artist
 
-        search_result = cloudsearch.GetSearchResult(keyword=f"{title} {artist}", limit=1)
-        songs = search_result.get('result', {}).get('songs')
-        if not songs: return
-        
-        song_info = songs[0]
-        song_id = song_info.get('id')
-        if not song_id: return
-        
-        title_from_api = song_info.get('name', title)
-        artist_str = '/'.join(a['name'] for a in song_info.get('ar', [])) or artist
-        album_str = song_info.get('al', {}).get('name', '')
-        
+        songs = _search_songs(f'{title} {artist}'.strip())
+        song = _choose_song(songs, title, artist)
+        if not song or not song.get('id'):
+            return
+
+        song_id = song['id']
+        title_from_api, artist_str, album_str = _names_from_song(song, title, artist)
         lyrics = None
-        try:
-            lrc_result = track.GetTrackLyrics(song_id)
-            lyrics = lrc_result.get('lrc', {}).get('lyric')
-        except Exception: pass
-
         cover_data = None
         try:
-            track_detail = track.GetTrackDetail(song_id)
-            pic_url = track_detail['songs'][0]['al']['picUrl']
-            if pic_url:
-                response = requests.get(pic_url, timeout=10)
-                response.raise_for_status()
-                cover_data = response.content
-        except Exception: pass
-            
-        audio = MP3(mp3_path)
+            lrc_result = _get_json(f'{_API}/api/song/lyric', {'id': song_id, 'lv': 1})
+            lyrics = (lrc_result.get('lrc') or {}).get('lyric')
+        except Exception:
+            pass
         try:
-            audio.delete()
-        except: pass
-        audio.tags = ID3()
-        audio.tags.add(TIT2(encoding=3, text=title_from_api))
-        audio.tags.add(TPE1(encoding=3, text=artist_str))
-        audio.tags.add(TALB(encoding=3, text=album_str))
-        if lyrics:
-            audio.tags.add(USLT(encoding=3, lang='XXX', desc='Lyrics', text=lyrics))
-        if cover_data:
-            audio.tags.add(APIC(encoding=3, mime='image/jpeg', type=3, desc='Cover', data=cover_data))
-        
-        audio.save(v2_version=3)
-    except Exception as e:
-        traceback.print_exc() 
+            detail = _get_json(
+                f'{_API}/api/song/detail/',
+                {'id': song_id, 'ids': f'[{song_id}]'},
+            )
+            detail_song = (detail.get('songs') or [None])[0]
+            if detail_song:
+                title_from_api, artist_str, album_str = _names_from_song(
+                    detail_song, title_from_api, artist_str
+                )
+                pic_url = (detail_song.get('album') or {}).get('picUrl')
+                if pic_url:
+                    response = requests.get(pic_url, headers=_HEADERS, timeout=10)
+                    response.raise_for_status()
+                    cover_data = response.content
+        except Exception:
+            pass
+
+        embed_tags(
+            audio_path,
+            title_from_api,
+            artist_str,
+            album=album_str,
+            lyrics=lyrics,
+            cover_data=cover_data,
+        )
+    except requests.RequestException as exc:
+        print(f'在线元数据获取失败，将只播放本地文件: {exc}')
+    except Exception:
+        traceback.print_exc()

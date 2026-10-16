@@ -28,7 +28,8 @@ from ui.style import STYLE_SHEET
 from ui.widgets import ElidedLabel, SongItemWidget
 from core.metadata import (
     get_song_metadata, convert_ncm_to_mp3, 
-    update_and_embed_metadata, get_cover_data_from_tags
+    update_and_embed_metadata, get_cover_data_from_tags,
+    has_audio_header, PLAYABLE_EXTENSIONS,
 )
 
 # Main Application Window
@@ -350,48 +351,69 @@ class NCMPlayerApp(QMainWindow):
 
     def process_files(self, ncm_paths):
         for path in ncm_paths:
-            file_to_check = os.path.basename(path).replace('.ncm', '.mp3')
-            if any(file_to_check in song['path'] for song in self.playlist_data):
-                print(f"Skipping duplicate: {file_to_check}")
+            stem = os.path.splitext(os.path.basename(path))[0]
+            existing = next(
+                (song for song in self.playlist_data if self._song_stem(song['path']) == stem),
+                None,
+            )
+            # A previous macOS 3.x decrypt can already be listed and still be
+            # unplayable. Import again and replace that file.
+            if existing and has_audio_header(existing['path']):
+                print(f"Skipping duplicate: {stem}")
                 continue
 
             converted_path = convert_ncm_to_mp3(path)
-            if converted_path:
+            if converted_path and has_audio_header(converted_path):
                 update_and_embed_metadata(converted_path, "", "") # Let it search by filename
                 metadata = get_song_metadata(converted_path)
                 if metadata:
                     # 发射信号，在主线程中处理UI更新
                     self.song_processed.emit(metadata)
+            elif converted_path:
+                print(f"Decrypted file is not playable audio: {converted_path}")
+
+    @staticmethod
+    def _song_stem(path):
+        return os.path.splitext(os.path.basename(path))[0]
     
     def add_song_to_playlist(self, song_metadata):
-        # 检查是否已存在相同的歌曲
-        for existing_song in self.playlist_data:
-            if existing_song['path'] == song_metadata['path']:
-                return  # 如果已存在，直接返回
+        display_text = f"{song_metadata['title']} - {song_metadata['artist']}"
+        stem = self._song_stem(song_metadata['path'])
+        for index, existing_song in enumerate(self.playlist_data):
+            if self._song_stem(existing_song['path']) == stem:
+                self.playlist_data[index] = song_metadata
+                item = self.playlist_widget.item(index)
+                if item is not None:
+                    item.setText(display_text)
+                print(f"Updated song in playlist: {display_text}")
+                return
         
         self.playlist_data.append(song_metadata)
         
         # 直接在主线程中更新UI
-        display_text = f"{song_metadata['title']} - {song_metadata['artist']}"
         list_item = QListWidgetItem(display_text)
         self.playlist_widget.addItem(list_item)
         
         print(f"Added song to playlist: {display_text}")  # 调试信息
 
     def load_existing_songs(self):
-        output_dir = 'output'
+        output_dir = os.path.abspath('output')
         if not os.path.exists(output_dir):
             return
         
         for filename in sorted(os.listdir(output_dir)):
-            if filename.lower().endswith('.mp3'):
-                file_path = os.path.join(output_dir, filename)
-                metadata = get_song_metadata(file_path)
-                if metadata:
-                    self.playlist_data.append(metadata)
-                    display_text = f"{metadata['title']} - {metadata['artist']}"
-                    list_item = QListWidgetItem(display_text)
-                    self.playlist_widget.addItem(list_item)
+            if os.path.splitext(filename)[1].lower() not in PLAYABLE_EXTENSIONS:
+                continue
+            file_path = os.path.join(output_dir, filename)
+            if not has_audio_header(file_path):
+                print(f"Skipping unplayable file: {file_path}")
+                continue
+            metadata = get_song_metadata(file_path)
+            if metadata:
+                self.playlist_data.append(metadata)
+                display_text = f"{metadata['title']} - {metadata['artist']}"
+                list_item = QListWidgetItem(display_text)
+                self.playlist_widget.addItem(list_item)
         
     def play_from_list(self, item):
         self.current_index = self.playlist_widget.row(item)
@@ -400,7 +422,8 @@ class NCMPlayerApp(QMainWindow):
     def play_current_song(self):
         if 0 <= self.current_index < len(self.playlist_data):
             song = self.playlist_data[self.current_index]
-            self.player.setSource(QUrl.fromLocalFile(song['path']))
+            # AVFoundation on macOS does not reliably open a relative file URL.
+            self.player.setSource(QUrl.fromLocalFile(os.path.abspath(song['path'])))
             self.player.play()
             
             self.title_label.setText(song['title'])

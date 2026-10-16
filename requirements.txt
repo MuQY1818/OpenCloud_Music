@@ -4,4 +4,3 @@ pycryptodome
 tqdm
 requests
 mutagen
-pyncm 
